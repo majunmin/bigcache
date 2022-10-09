@@ -13,12 +13,12 @@ const (
 // It keeps entries on heap but omits GC for them. To achieve that, operations take place on byte arrays,
 // therefore entries (de)serialization in front of the cache will be needed in most use cases.
 type BigCache struct {
-	shards     []*cacheShard
+	shards     []*cacheShard // shard分片 减小锁粒度,长度为 2^N
 	lifeWindow uint64
 	clock      clock
-	hash       Hasher
+	hash       Hasher // hash 算法 分 shard, 默认 使用 fnv hash算法
 	config     Config
-	shardMask  uint64
+	shardMask  uint64 // 2^N-1
 	close      chan struct{}
 }
 
@@ -84,10 +84,12 @@ func newBigCache(config Config, clock clock) (*BigCache, error) {
 		onRemove = cache.notProvidedOnRemove
 	}
 
+	// 逐个初始化  shard
 	for i := 0; i < config.Shards; i++ {
 		cache.shards[i] = initNewShard(config, onRemove, clock)
 	}
 
+	// 主动清理  过期数据
 	if config.CleanWindow > 0 {
 		go func() {
 			ticker := time.NewTicker(config.CleanWindow)

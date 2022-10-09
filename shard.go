@@ -16,21 +16,21 @@ type Metadata struct {
 }
 
 type cacheShard struct {
-	hashmap     map[uint64]uint32
-	entries     queue.BytesQueue
-	lock        sync.RWMutex
-	entryBuffer []byte
-	onRemove    onRemoveCallback
+	hashmap     map[uint64]uint32 //存储索引 key: hashKey  value: value存入  byteQueue的 offset
+	entries     queue.BytesQueue  // 存储实际的数据 的 环形字节数组
+	lock        sync.RWMutex      // 锁,保护 entrys
+	entryBuffer []byte            //
+	onRemove    onRemoveCallback  // 回调函数, 有多种实现方式
 
-	isVerbose    bool
+	isVerbose    bool // 是否 打印 GC日志
 	statsEnabled bool
 	logger       Logger
 	clock        clock
-	lifeWindow   uint64
+	lifeWindow   uint64 // 超过了 这个 窗口 才会对数据 实际的进行清除
 
-	hashmapStats map[uint64]uint32
-	stats        Stats
-	cleanEnabled bool
+	hashmapStats map[uint64]uint32 // 记录 key的 requestCount
+	stats        Stats             // shard 的 缓存 统计状态
+	cleanEnabled bool              // 是否开启 清理
 }
 
 func (s *cacheShard) getWithInfo(key string, hashedKey uint64) (entry []byte, resp Response, err error) {
@@ -51,6 +51,7 @@ func (s *cacheShard) getWithInfo(key string, hashedKey uint64) (entry []byte, re
 	}
 
 	entry = readEntry(wrappedEntry)
+	// 判断 entry 是否过期, timestamp > current || current - timestamp > lifeWindow
 	if s.isExpired(wrappedEntry, currentTime) {
 		resp.EntryStatus = Expired
 	}
@@ -66,6 +67,8 @@ func (s *cacheShard) get(key string, hashedKey uint64) ([]byte, error) {
 		s.lock.RUnlock()
 		return nil, err
 	}
+	// 判断 key 是否相同. 当发生hash冲突时,如果 key不相同, 直接返回 ErrEntryNotFound
+	// bigcache 不解决 hash Collision
 	if entryKey := readKeyFromEntry(wrappedEntry); key != entryKey {
 		s.lock.RUnlock()
 		s.collision()
@@ -122,6 +125,7 @@ func (s *cacheShard) set(key string, hashedKey uint64, entry []byte) error {
 
 	s.lock.Lock()
 
+	// 如果 找到了, 说明  存在 hash Collision | key 已存在(并未进行更新), 那么 将 原来的 entry 标记为删除 (hash = 0)
 	if previousIndex := s.hashmap[hashedKey]; previousIndex != 0 {
 		if previousEntry, err := s.entries.Get(int(previousIndex)); err == nil {
 			resetKeyFromEntry(previousEntry)
@@ -130,20 +134,25 @@ func (s *cacheShard) set(key string, hashedKey uint64, entry []byte) error {
 		}
 	}
 
+	// 如果 未开启 一不定式清理任务, 就主动清理过期数据.
 	if !s.cleanEnabled {
 		if oldestEntry, err := s.entries.Peek(); err == nil {
 			s.onEvict(oldestEntry, currentTimestamp, s.removeOldestEntry)
 		}
 	}
 
+	// 将数据封装成 entry .
 	w := wrapEntry(currentTimestamp, hashedKey, key, entry, &s.entryBuffer)
 
+	//  循环目的是为了 保证 一定放入 数据成功.
 	for {
 		if index, err := s.entries.Push(w); err == nil {
 			s.hashmap[hashedKey] = uint32(index)
 			s.lock.Unlock()
 			return nil
 		}
+
+		//如果 空间 不足, 就 主动调用 LRU算法 清理空间,直到 放入 数据.
 		if s.removeOldestEntry(NoSpace) != nil {
 			s.lock.Unlock()
 			return fmt.Errorf("entry is bigger than max shard size")
@@ -221,6 +230,8 @@ func (s *cacheShard) append(key string, hashedKey uint64, entry []byte) error {
 	return err
 }
 
+// Optimistic 乐观锁机制
+// 主动删除, 将 entry 中 hash值 置为 0(删除标志,并不是立即回收空间), 避免添加写锁.
 func (s *cacheShard) del(hashedKey uint64) error {
 	// Optimistic pre-check using only readlock
 	s.lock.RLock()
@@ -281,6 +292,7 @@ func (s *cacheShard) onEvict(oldestEntry []byte, currentTimestamp uint64, evict 
 	return false
 }
 
+//过期时间 超过  s.lifeWindow,  会返回 true
 func (s *cacheShard) isExpired(oldestEntry []byte, currentTimestamp uint64) bool {
 	oldestTimestamp := readTimestampFromEntry(oldestEntry)
 	if currentTimestamp <= oldestTimestamp { // if currentTimestamp < oldestTimestamp, the result will out of uint64 limits;

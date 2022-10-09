@@ -8,8 +8,10 @@ import (
 
 const (
 	// Number of bytes to encode 0 in uvarint format
+	// 8 + 8 + 1
 	minimumHeaderSize = 17 // 1 byte blobsize + timestampSizeInBytes + hashSizeInBytes
 	// Bytes before left margin are not used. Zero index means element does not exist in queue, useful while reading slice from index
+	// 不使用 leftMargin 左边的 字节,  0 index 意味着 队列中不存在元素, 从slice中读取元素很 有用
 	leftMarginIndex = 1
 )
 
@@ -86,14 +88,17 @@ func (q *BytesQueue) Reset() {
 // Push copies entry at the end of queue and moves tail pointer. Allocates more space if needed.
 // Returns index for pushed data or error if maximum size queue limit is reached.
 func (q *BytesQueue) Push(data []byte) (int, error) {
-	neededSize := getNeededSize(len(data))
+	neededSize := getNeededSize(len(data)) // bytes
 
 	if !q.canInsertAfterTail(neededSize) {
-		if q.canInsertBeforeHead(neededSize) {
+		if q.canInsertBeforeHead(neededSize) { // 这两步 是为了 将  data连续存储
+			// 插入到了  head之前
 			q.tail = leftMarginIndex
 		} else if q.capacity+neededSize >= q.maxCapacity && q.maxCapacity > 0 {
+			//超出 容量了,返回
 			return -1, &queueError{"Full queue. Maximum size limit reached."}
 		} else {
+			// 未达到 最大容量,进行扩容(这里可能会影响性能)
 			q.allocateAdditionalMemory(neededSize)
 		}
 	}
@@ -105,6 +110,7 @@ func (q *BytesQueue) Push(data []byte) (int, error) {
 	return index, nil
 }
 
+// 扩容 minimum 最小扩容的 容量(插入元素的 大小)
 func (q *BytesQueue) allocateAdditionalMemory(minimum int) {
 	start := time.Now()
 	if q.capacity < minimum {
@@ -119,7 +125,7 @@ func (q *BytesQueue) allocateAdditionalMemory(minimum int) {
 	q.array = make([]byte, q.capacity)
 
 	if leftMarginIndex != q.rightMargin {
-		copy(q.array, oldArray[:q.rightMargin])
+		copy(q.array, oldArray[:q.rightMargin]) // 将当前 shard 中老数据 拷贝到 新数据中去
 
 		if q.tail <= q.head {
 			if q.tail != q.head {
@@ -242,6 +248,9 @@ func (q *BytesQueue) peek(index int) ([]byte, int, error) {
 	return q.array[index+n : index+int(blockSize)], int(blockSize), nil
 }
 
+// byteQueue 是一个循环队列,可能得状态是
+//  ---- head ---- tail ---- cap
+//   ---tail ---- head ---- cap
 // canInsertAfterTail returns true if it's possible to insert an entry of size of need after the tail of the queue
 func (q *BytesQueue) canInsertAfterTail(need int) bool {
 	if q.full {
@@ -253,7 +262,7 @@ func (q *BytesQueue) canInsertAfterTail(need int) bool {
 	// 1. there is exactly need bytes between head and tail, so we do not need
 	// to reserve extra space for a potential empty entry when realloc this queue
 	// 2. still have unused space between tail and head, then we must reserve
-	// at least headerEntrySize bytes so we can put an empty entry
+	// at least headerentrysize bytes so we can put an empty entry
 	return q.head-q.tail == need || q.head-q.tail >= need+minimumHeaderSize
 }
 
